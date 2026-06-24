@@ -230,6 +230,35 @@
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
   @media (max-width: 700px) { .cards { grid-template-columns: 1fr; } #home { padding: 24px 20px; } }
+
+  /* ── PR Diff Review Mode ── */
+  .author-panel {
+    width: 280px; flex-shrink: 0; border-right: 1px solid var(--border);
+    background: var(--surface2); overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .author-panel-title { font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--accent); }
+  .author-task  { font-size: 13px; color: var(--text); line-height: 1.65; }
+  .author-goal  { font-size: 12px; color: var(--muted); }
+  .author-goal ul { padding-left: 16px; margin-top: 6px; }
+  .author-goal li { margin-bottom: 5px; line-height: 1.5; }
+  .author-question { font-size: 12px; font-style: italic; color: var(--muted);
+    border-top: 1px solid var(--border); padding-top: 12px; }
+  .pr-badge { background: #1a1a3e; color: #a78bfa; border: 1px solid #a78bfa; }
+
+  .diff-line-added   { background: rgba(46,160,67,.1); }
+  .diff-line-removed { background: rgba(248,81,73,.1); }
+  .diff-line-header  { background: rgba(88,166,255,.07); }
+  .diff-line-added   .line-code code { color: #aff5b4 !important; }
+  .diff-line-removed .line-code code { color: #ffc1c0 !important; opacity: .85; }
+  .diff-line-header  .line-code code { color: var(--accent) !important; font-size: 12px; }
+  .diff-marker { width: 18px; text-align: center; padding: 0 3px; font-size: 12px;
+    font-weight: 700; user-select: none; vertical-align: top; }
+  .diff-marker.add { color: var(--easy); }
+  .diff-marker.rem { color: var(--hard); }
+  .diff-marker.hdr { color: var(--accent); }
+  .diff-marker.ctx { color: transparent; }
 </style>
 </head>
 <body>
@@ -251,7 +280,7 @@
     <div class="review-meta" id="review-meta">0 comments</div>
     <button class="submit-btn" id="submit-btn" onclick="submitReview()">Submit Review</button>
   </div>
-  <div class="review-body">
+  <div class="review-body" id="review-body">
     <div class="code-panel" id="code-panel">
       <div class="code-file-header">📄 <span id="code-filename">—</span></div>
       <table class="code-table" id="code-table"><tbody id="code-body"></tbody></table>
@@ -1411,7 +1440,272 @@ public class BatchOrderProcessor {
       commentTemplate: '"System.out.println() for a negative-total warning is invisible in production log aggregators. This should either throw a ValidationException (fail fast) or log.warn() so it appears in monitoring."'
     }
   ]
+},
+
+// ─────────────────────────────────────────────────────────────────
+// PR REVIEW SNIPPETS  (diff format — HackerRank style)
+// ─────────────────────────────────────────────────────────────────
+
+{
+  id: 'pr-01', type: 'diff', level: 'Medium',
+  title: 'Add In-Memory Caching to UserService',
+  filename: 'UserService.java',
+  authorName: 'Alex K.',
+  authorNote: 'getUserById() hits the database on every call. Under current load it fires ~2,000 times/min and is causing DB CPU spikes. I\'ve added a simple in-memory HashMap cache so repeat lookups are served from memory. Cache is also updated on updateUser() to stay consistent.',
+  goalBullets: ['Reduce DB round-trips for repeated user lookups','Invalidate / update the entry when updateUser() is called','Keep the change minimal — no new library dependencies'],
+  diff: `@@ -1,13 +1,21 @@
+ import java.util.*;
+
+ public class UserService {
+
++    private Map<String, User> cache = new HashMap<>();
++
+     public User getUserById(String id) {
++        if (cache.containsKey(id)) {
++            return cache.get(id);
++        }
+         User user = userRepository.findById(id);
++        cache.put(id, user);
+         return user;
+     }
+
+     public void updateUser(User user) {
+         userRepository.save(user);
++        cache.put(user.getId(), user);
+     }
+ }`,
+  issues: [
+    { title: 'HashMap Not Thread-Safe and Unbounded',
+      lines: [6], severity: 'high',
+      keywords: ['thread','concurrent','hashmap','safe','concurrenthashmap','bounded','size','limit','synchronized','rehash'],
+      fix: 'Use ConcurrentHashMap. HashMap is not thread-safe — concurrent put() during rehashing corrupts its internal structure causing an infinite CPU loop in production. Also add a size cap or switch to Caffeine to prevent unbounded memory growth.',
+      commentTemplate: '"HashMap is not thread-safe — concurrent put() calls during rehashing corrupt its structure and can cause an infinite loop. Use ConcurrentHashMap. The cache also has no size limit and will grow unboundedly."'
+    },
+    { title: 'TOCTOU: containsKey() + get() Are Two Separate Operations',
+      lines: [9,10], severity: 'high',
+      keywords: ['toctou','atomic','containskey','get','race','two','check','evict','single'],
+      fix: 'Replace containsKey() + get() with a single cache.get(id) call and null-check the result. Between the two calls another thread can evict the entry, making get() return null even though containsKey() returned true.',
+      commentTemplate: '"containsKey() + get() is a TOCTOU race — another thread can evict the entry between the two calls causing get() to return null. Use a single cache.get(id) and null-check the result."'
+    },
+    { title: 'Caches Null if Repository Returns Null',
+      lines: [12,13], severity: 'medium',
+      keywords: ['null','npe','nullable','check','findbyid','put','absent','missing','guard'],
+      fix: 'Check for null before caching: if (user != null) cache.put(id, user). If findById returns null for a missing user, cache.put(id, null) stores a null entry — callers get back null from cache and are likely to NPE on it.',
+      commentTemplate: '"If userRepository.findById() returns null, this stores null in the cache. Any subsequent lookup returns the cached null, and callers that dereference the result immediately will NPE. Guard with a null check before put."'
+    }
+  ]
+},
+
+{
+  id: 'pr-02', type: 'diff', level: 'Medium',
+  title: 'Add Retry Logic to PaymentService',
+  filename: 'PaymentService.java',
+  authorName: 'Sam R.',
+  authorNote: 'Our payment gateway returns transient errors for ~0.5% of calls. Currently those surface as customer-visible failures. I\'ve added a retry loop (up to 3 attempts) so single-call blips are handled automatically without surfacing to the caller.',
+  goalBullets: ['Automatically retry failed gateway calls up to 3 times','Reduce customer-visible errors caused by transient gateway blips','Keep the public API signature of charge() unchanged'],
+  diff: `@@ -1,8 +1,18 @@
+ public class PaymentService {
+
++    private static final int MAX_RETRIES = 3;
++
+-    public PaymentResult charge(PaymentRequest request) {
+-        return gateway.charge(request);
++    public PaymentResult charge(PaymentRequest request) {
++        int attempts = 0;
++        while (attempts < MAX_RETRIES) {
++            try {
++                return gateway.charge(request);
++            } catch (Exception e) {
++                attempts++;
++            }
++        }
++        return null;
+     }
+ }`,
+  issues: [
+    { title: 'catch(Exception) Too Broad — Retries Programming Errors',
+      lines: [13], severity: 'high',
+      keywords: ['exception','broad','specific','catch','npe','programming','retryable','paymentexception','ioexception','type'],
+      fix: 'Catch only retryable exceptions (e.g. IOException or a specific GatewayTimeoutException). Catching Exception retries NullPointerExceptions and other programming bugs where retrying will never help — it just delays the inevitable failure.',
+      commentTemplate: '"catch(Exception) is too broad — it retries NullPointerExceptions and programming errors that no amount of retrying will fix. Catch only specific, retryable exceptions like GatewayTimeoutException or IOException."'
+    },
+    { title: 'No Backoff Between Retry Attempts',
+      lines: [13,14], severity: 'medium',
+      keywords: ['backoff','sleep','delay','exponential','immediate','wait','throttle','load','hammering'],
+      fix: 'Add Thread.sleep() with exponential backoff between attempts: e.g. Thread.sleep(100L * (1L << attempts)). Retrying immediately hammers an already-struggling gateway, adds load, and can worsen rate limiting or cascading failures.',
+      commentTemplate: '"There is no sleep or backoff between retries. Immediately retrying a failing payment gateway 3 times in a tight loop adds load to an already-struggling service and can make rate limiting worse. Add exponential backoff."'
+    },
+    { title: 'Returns null on Final Failure — Root Cause Silently Discarded',
+      lines: [17], severity: 'high',
+      keywords: ['null','exception','throw','rethrow','context','root','cause','last','failure','return'],
+      fix: 'Rethrow the last exception instead of returning null: throw new PaymentException("Failed after " + MAX_RETRIES + " attempts", lastException). Returning null forces every caller to null-check and loses the original error context entirely.',
+      commentTemplate: '"return null after all retries discards the root cause silently. The caller gets a null result with no information about what failed. Save the last exception and rethrow it (wrapped if needed) so callers can act on the error."'
+    }
+  ]
+},
+
+{
+  id: 'pr-03', type: 'diff', level: 'Easy',
+  title: 'Add Username Validation and SQL Persistence to AccountService',
+  filename: 'AccountService.java',
+  authorName: 'Priya M.',
+  authorNote: 'Migrating from the ORM layer to direct JDBC for performance. I\'ve also added username validation (length/null check) as the security team requested. The same service handles both initial account creation and username updates.',
+  goalBullets: ['Validate usernames before storing (null-safe, length 3-50)','Switch createAccount() and updateUsername() from ORM to raw SQL','Improve query performance by bypassing the ORM'],
+  diff: `@@ -1,10 +1,24 @@
+ public class AccountService {
+
++    private void validateUsername(String username) {
++        if (username == null || username.length() < 3 || username.length() > 50) {
++            throw new ValidationException("Invalid username");
++        }
++    }
++
+     public User createAccount(String username, String email) {
+-        return userRepository.save(new User(username, email));
++        validateUsername(username);
++        String sql = "INSERT INTO users (username, email) VALUES ('"
++                   + username + "', '" + email + "')";
++        return db.execute(sql);
+     }
+
+     public User updateUsername(String userId, String newUsername) {
+-        User user = userRepository.findById(userId);
+-        user.setUsername(newUsername);
+-        return userRepository.save(user);
++        String sql = "UPDATE users SET username = '" + newUsername
++                   + "' WHERE id = " + userId;
++        return db.execute(sql);
+     }
+ }`,
+  issues: [
+    { title: '[CRITICAL] SQL Injection in createAccount()',
+      lines: [12,13,14], severity: 'critical',
+      keywords: ['sql','injection','prepared','parameterized','concatenat','?','statement','owasp','email','username'],
+      fix: 'Use PreparedStatement: "INSERT INTO users (username, email) VALUES (?, ?)" with stmt.setString(1, username); stmt.setString(2, email). String concatenation lets a crafted email like "x\'); DROP TABLE users;--" execute arbitrary SQL.',
+      commentTemplate: '"[CRITICAL] Both username and email are concatenated directly into the SQL string. An attacker can supply email = \'x\'); DROP TABLE users;-- to execute arbitrary SQL. Use PreparedStatement with ? placeholders."'
+    },
+    { title: '[CRITICAL] SQL Injection in updateUsername()',
+      lines: [19,20], severity: 'critical',
+      keywords: ['sql','injection','prepared','parameterized','concatenat','?','statement','update','userid','newusername'],
+      fix: 'Use PreparedStatement: "UPDATE users SET username = ? WHERE id = ?" with stmt.setString(1, newUsername); stmt.setString(2, userId). Both newUsername and userId are injectable.',
+      commentTemplate: '"[CRITICAL] updateUsername() also concatenates newUsername and userId into SQL. Both are injectable. Use PreparedStatement with ? for every dynamic value."'
+    },
+    { title: 'validateUsername() Not Called in updateUsername()',
+      lines: [17,18], severity: 'medium',
+      keywords: ['validate','missing','inconsistent','update','call','username','length','null'],
+      fix: 'Call validateUsername(newUsername) at the top of updateUsername() just as it is called in createAccount(). The validation added in this PR only protects account creation — the update path is unprotected.',
+      commentTemplate: '"validateUsername() is called in createAccount() but not in updateUsername(). A user can set an empty or null username via the update path, bypassing the validation that was just added in this PR."'
+    }
+  ]
+},
+
+{
+  id: 'pr-04', type: 'diff', level: 'Hard',
+  title: 'Move OrderProcessor to Async Thread-per-Order',
+  filename: 'OrderProcessor.java',
+  authorName: 'Jordan T.',
+  authorNote: 'Order processing is synchronous right now — it blocks the HTTP thread while calling inventory, payment, and notifications in sequence. I\'ve moved each order to its own thread so orders are processed in parallel. Also added a counter to track how many orders have been processed.',
+  goalBullets: ['Process orders in parallel instead of sequentially','Free the calling thread immediately after dispatch','Track total number of successfully processed orders'],
+  diff: `@@ -1,14 +1,18 @@
+ public class OrderProcessor {
+
++    private int processedCount = 0;
++
+     public void process(List<Order> orders) {
+-        for (Order order : orders) {
+-            processOrder(order);
+-        }
++        for (Order order : orders) {
++            new Thread(() -> {
++                processOrder(order);
++                processedCount++;
++            }).start();
++        }
+     }
+
+     private void processOrder(Order order) {
+         inventoryService.reserve(order);
+         paymentService.charge(order);
+         notificationService.notify(order);
+     }
+ }`,
+  issues: [
+    { title: 'processedCount Is Not Atomic — Race Condition',
+      lines: [4,13], severity: 'high',
+      keywords: ['atomic','thread','race','counter','concurrent','synchronized','atomicinteger','parallel','volatile'],
+      fix: 'Use AtomicInteger: private final AtomicInteger processedCount = new AtomicInteger(0); then processedCount.incrementAndGet(). The ++ operator is read-modify-write — not atomic. Under concurrent access increments are silently lost.',
+      commentTemplate: '"processedCount++ is not atomic — it is read-modify-write across multiple bytecode instructions. Multiple threads incrementing simultaneously lose updates. Use AtomicInteger.incrementAndGet()."'
+    },
+    { title: 'Unbounded Thread Creation — new Thread() Per Order',
+      lines: [11,14], severity: 'high',
+      keywords: ['thread','pool','executor','bounded','exhaustion','new','runnable','service','fixed','cachedthreadpool'],
+      fix: 'Use an ExecutorService: ExecutorService pool = Executors.newFixedThreadPool(N); pool.submit(() -> {...}). Creating a new thread per order creates thousands of OS threads under load, exhausting resources and crashing the JVM.',
+      commentTemplate: '"new Thread() is created for every order in the batch. Under load this creates thousands of OS threads, exhausting thread-stack memory and crashing the JVM. Use an ExecutorService with a bounded thread pool."'
+    },
+    { title: 'Exception in Worker Thread Is Silently Lost',
+      lines: [11,12,13,14], severity: 'high',
+      keywords: ['exception','silent','catch','lost','thread','uncaught','runnable','swallow','handler'],
+      fix: 'Wrap the lambda body in try-catch and log failures: try { processOrder(order); } catch (Exception e) { log.error("Failed order {}", order.getId(), e); }. Uncaught exceptions in a Runnable are swallowed — payment failures become invisible.',
+      commentTemplate: '"If processOrder() throws, the Runnable swallows the exception silently. A failed payment or inventory reservation leaves no trace. Wrap the body in try-catch and log failures with the order ID."'
+    },
+    { title: 'No Way to Know When All Orders Have Completed',
+      lines: [10,15], severity: 'medium',
+      keywords: ['join','await','completablefuture','countdown','latch','barrier','coordination','complete','future'],
+      fix: 'Collect the threads or use CompletableFuture.allOf() / CountDownLatch to track completion. The current code fires threads and returns immediately — the caller cannot wait for all orders to finish or detect when the batch is done.',
+      commentTemplate: '"process() fires threads and returns immediately. The caller has no way to know when all orders finish or how many succeeded. Use CompletableFuture.allOf() or a CountDownLatch to track batch completion."'
+    }
+  ]
+},
+
+{
+  id: 'pr-05', type: 'diff', level: 'Hard',
+  title: 'Add Discount Code Support to CartService',
+  filename: 'CartService.java',
+  authorName: 'Riley C.',
+  authorNote: 'Marketing wants to launch promo discount codes. I\'ve added discount code lookup to the checkout flow — if a valid, unused code is found its rate is applied to the cart total before tax. The code is marked used immediately when applied so it cannot be redeemed twice.',
+  goalBullets: ['Look up discount code and apply its rate to the cart total','Ensure each discount code can only be used once','Return a detailed OrderSummary with breakdown of discount and tax'],
+  diff: `@@ -1,10 +1,20 @@
+ public class CartService {
+
+     public OrderSummary checkout(Cart cart, String discountCode) {
++        double discount = 0;
++        if (discountCode != null) {
++            Discount d = discountService.find(discountCode);
++            if (d != null && !d.isUsed()) {
++                discount = cart.getTotal() * d.getRate();
++                d.markUsed();
++            }
++        }
++
+         double subtotal = cart.getTotal();
+         double tax = subtotal * 0.18;
+-        return new OrderSummary(subtotal, tax, subtotal + tax);
++        double finalTotal = subtotal - discount + tax;
++        return new OrderSummary(subtotal, discount, tax, finalTotal);
+     }
+ }`,
+  issues: [
+    { title: 'Race Condition: isUsed() Check and markUsed() Are Not Atomic',
+      lines: [8,9,10], severity: 'critical',
+      keywords: ['race','atomic','concurrent','synchronized','toctou','check','mark','used','twice','double'],
+      fix: 'Make the check-and-mark atomic: use an optimistic lock or a database-level compare-and-swap (UPDATE discounts SET used=true WHERE id=? AND used=false, checking rowsUpdated==1). Two concurrent checkouts with the same code both pass the isUsed() check before either calls markUsed().',
+      commentTemplate: '"d.isUsed() and d.markUsed() are two separate operations. Two concurrent checkout requests with the same code can both pass the isUsed() check before either marks it used — the discount is applied twice. Make the check-and-mark atomic at the database level."'
+    },
+    { title: 'Discount Marked Used Before Payment Is Confirmed',
+      lines: [10], severity: 'high',
+      keywords: ['premature','payment','confirm','rollback','transact','before','used','fail','refund','atomic'],
+      fix: 'Mark the discount code used only after payment succeeds, or use a transactional approach (mark PENDING, then USED on success, RELEASED on failure). If payment fails after markUsed(), the customer loses their valid discount code permanently.',
+      commentTemplate: '"d.markUsed() is called before the payment is attempted. If paymentService.charge() fails later, the discount code is permanently consumed even though no payment was made. Mark codes used only after payment succeeds."'
+    },
+    { title: 'Magic Number: Tax Rate 0.18 Is a Hardcoded Literal',
+      lines: [14], severity: 'low',
+      keywords: ['magic','constant','named','tax','rate','literal','0.18','named','extract','config'],
+      fix: 'Extract to a named constant: private static final double TAX_RATE = 0.18; Tax rates change — a magic literal scattered through the codebase means a silent business logic error on the next tax-rate update.',
+      commentTemplate: '"0.18 is a magic number for the tax rate. Tax rates change by jurisdiction and over time — extract to a named constant TAX_RATE (or better, make it configurable) so a future change is made in one place."'
+    }
+  ]
 }
+
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -1438,13 +1732,15 @@ function renderHome() {
     snips.forEach(s => {
       const done = completedSnippets[s.id];
       const pct = done ? Math.round((done.score / done.total) * 100) : null;
+      const isPR = s.type === 'diff';
       html += `<div class="card" onclick="openSnippet('${s.id}')">
         <div class="card-top">
           <span class="level-badge ${cls}-badge">${level}</span>
+          ${isPR ? '<span class="level-badge pr-badge">PR Review</span>' : ''}
           <span class="issue-count">${s.issues.length} issues</span>
         </div>
         <div class="card-title">${s.title}</div>
-        <div class="card-topics">${s.topics}</div>
+        <div class="card-topics">${isPR ? s.filename : s.topics}</div>
         <div class="card-status ${done ? 'status-done' : ''}">
           ${done ? `✓ Reviewed — ${pct}% (${done.score}/${done.total} pts)` : 'Not reviewed yet'}
         </div>
@@ -1477,9 +1773,117 @@ function openSnippet(id) {
   rev.style.display = 'flex';
 
   document.getElementById('review-title').textContent = currentSnippet.title;
-  document.getElementById('code-filename').textContent = currentSnippet.filename;
   updateCommentCount();
-  renderCode();
+
+  if (currentSnippet.type === 'diff') {
+    setupPRView();
+    renderDiff();
+  } else {
+    setupCodeView();
+    renderCode();
+  }
+}
+
+function setupCodeView() {
+  const body = document.getElementById('review-body');
+  // Remove author panel if previously in PR mode
+  const existing = document.getElementById('author-panel');
+  if (existing) existing.remove();
+  document.getElementById('code-filename').textContent = currentSnippet.filename;
+}
+
+function setupPRView() {
+  const body = document.getElementById('review-body');
+  // Remove any existing author panel and re-inject
+  const existing = document.getElementById('author-panel');
+  if (existing) existing.remove();
+  const panel = document.createElement('div');
+  panel.className = 'author-panel';
+  panel.id = 'author-panel';
+  const bullets = currentSnippet.goalBullets.map(b => `<li>${escapeHtml(b)}</li>`).join('');
+  panel.innerHTML = `
+    <div class="author-panel-title">Author · ${escapeHtml(currentSnippet.authorName)}</div>
+    <div class="author-task">${escapeHtml(currentSnippet.authorNote)}</div>
+    <div class="author-goal">
+      <strong style="color:var(--text);font-size:12px">Goals of this change:</strong>
+      <ul>${bullets}</ul>
+    </div>
+    <div class="author-question">Review this diff and add inline comments on any lines you think have issues.</div>
+  `;
+  body.insertBefore(panel, body.firstChild);
+  document.getElementById('code-filename').textContent = currentSnippet.filename;
+}
+
+function renderDiff() {
+  const tbody = document.getElementById('code-body');
+  tbody.innerHTML = '';
+
+  const lines = currentSnippet.diff.split('\n');
+  lines.forEach((rawLine, i) => {
+    const lineNum = i + 1;
+    const marker = rawLine[0];
+    const type = marker === '@' ? 'header' : marker === '+' ? 'added' : marker === '-' ? 'removed' : 'context';
+    const content = (type === 'header') ? rawLine : rawLine.slice(1);
+    const rowClass = type === 'added' ? 'diff-line-added' : type === 'removed' ? 'diff-line-removed' : type === 'header' ? 'diff-line-header' : '';
+    const markerChar = type === 'added' ? '+' : type === 'removed' ? '-' : type === 'header' ? '@@' : '';
+    const markerCls  = type === 'added' ? 'add' : type === 'removed' ? 'rem' : type === 'header' ? 'hdr' : 'ctx';
+    const hasComment = comments.some(c => c.lineNum === lineNum);
+
+    const tr = document.createElement('tr');
+    tr.id = `line-${lineNum}`;
+    tr.className = [rowClass, hasComment ? 'has-comment' : ''].filter(Boolean).join(' ');
+    tr.innerHTML = `
+      <td class="line-num">
+        <button class="add-comment-btn" onclick="toggleCommentForm(${lineNum})">+</button>
+        ${lineNum}
+      </td>
+      <td class="diff-marker ${markerCls}">${escapeHtml(markerChar)}</td>
+      <td class="line-code"><code class="language-java">${escapeHtml(content)}</code></td>`;
+    tbody.appendChild(tr);
+
+    if (activeFormLine === lineNum) {
+      const formTr = document.createElement('tr');
+      formTr.className = 'comment-form-row';
+      formTr.id = `form-row-${lineNum}`;
+      formTr.innerHTML = `<td colspan="3">
+        <div class="comment-form-wrap">
+          <div class="comment-form-label">Comment on <strong>line ${lineNum}</strong></div>
+          <textarea class="comment-textarea" id="comment-input-${lineNum}"
+            placeholder="Describe the issue: What is wrong? Why is it a problem? How would you fix it?"
+            onkeydown="handleCommentKey(event, ${lineNum})"></textarea>
+          <div class="comment-form-actions">
+            <button class="save-comment-btn" onclick="saveComment(${lineNum})">Save Comment</button>
+            <button class="cancel-comment-btn" onclick="cancelForm()">Cancel</button>
+          </div>
+        </div>
+      </td>`;
+      tbody.appendChild(formTr);
+    }
+
+    const lineComments = comments.filter(c => c.lineNum === lineNum);
+    lineComments.forEach(c => {
+      const threadTr = document.createElement('tr');
+      threadTr.className = 'comment-thread-row';
+      threadTr.id = `comment-row-${c.id}`;
+      threadTr.innerHTML = `<td colspan="3">
+        <div class="comment-thread-wrap">
+          <div class="comment-avatar">Y</div>
+          <div class="comment-body-wrap">
+            <span class="comment-author">Your Review</span>
+            <span class="comment-line-ref">· line ${lineNum}</span>
+            <div class="comment-text">${escapeHtml(c.text)}</div>
+          </div>
+          <button class="comment-delete" onclick="deleteComment('${c.id}')">✕</button>
+        </div>
+      </td>`;
+      tbody.appendChild(threadTr);
+    });
+  });
+
+  // Syntax highlight
+  document.querySelectorAll('#code-body code').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
 }
 
 function retrySnippet() {
@@ -1556,13 +1960,18 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function rerender() {
+  if (currentSnippet && currentSnippet.type === 'diff') renderDiff();
+  else renderCode();
+}
+
 function toggleCommentForm(lineNum) {
   if (activeFormLine === lineNum) {
     activeFormLine = null;
   } else {
     activeFormLine = lineNum;
   }
-  renderCode();
+  rerender();
   if (activeFormLine) {
     const ta = document.getElementById(`comment-input-${lineNum}`);
     if (ta) ta.focus();
@@ -1571,7 +1980,7 @@ function toggleCommentForm(lineNum) {
 
 function cancelForm() {
   activeFormLine = null;
-  renderCode();
+  rerender();
 }
 
 function handleCommentKey(e, lineNum) {
@@ -1586,13 +1995,13 @@ function saveComment(lineNum) {
   comments.push({ id: `c-${Date.now()}-${lineNum}`, lineNum, text });
   activeFormLine = null;
   updateCommentCount();
-  renderCode();
+  rerender();
 }
 
 function deleteComment(id) {
   comments = comments.filter(c => c.id !== id);
   updateCommentCount();
-  renderCode();
+  rerender();
 }
 
 function updateCommentCount() {
