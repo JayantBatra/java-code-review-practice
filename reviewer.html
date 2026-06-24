@@ -1715,7 +1715,7 @@ public class BatchOrderProcessor {
 let currentSnippet = null;
 let comments = [];           // { lineNum, text }
 let activeFormLine = null;
-let completedSnippets = {};  // id -> { score, total }
+let completedSnippets = JSON.parse(localStorage.getItem('jcrp_progress') || '{}');
 
 // ═══════════════════════════════════════════════════════════════
 // HOME
@@ -2049,6 +2049,7 @@ function submitReview() {
   });
 
   completedSnippets[s.id] = { score: earnedPts, total: totalPts };
+  localStorage.setItem('jcrp_progress', JSON.stringify(completedSnippets));
   showResults(results, earnedPts, totalPts);
 }
 
