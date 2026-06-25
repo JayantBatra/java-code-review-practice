@@ -1704,6 +1704,927 @@ public class BatchOrderProcessor {
       commentTemplate: '"0.18 is a magic number for the tax rate. Tax rates change by jurisdiction and over time — extract to a named constant TAX_RATE (or better, make it configurable) so a future change is made in one place."'
     }
   ]
+},
+
+// ─────────────────────────────────────────────────────────────────
+// PRODUCTION-STYLE PR REVIEW SNIPPETS  (interview-grade, 90-160 lines)
+// ─────────────────────────────────────────────────────────────────
+
+{
+  id: 'pr-06', type: 'diff', level: 'Easy',
+  title: 'Add Pagination to User Listing Endpoint',
+  filename: 'UserController.java',
+  authorName: 'Mia T.',
+  authorNote: 'The GET /users endpoint loads every user from the database into memory on every call — it broke prod last week at 2 AM when we hit 300k users. I\'ve added Spring Pageable support with page/size query params, a keyword search endpoint, and two new management endpoints. Most responses already use UserResponse DTO.',
+  goalBullets: ['Replace full table scan with paginated query using Spring Pageable','Add keyword search with optional role filter','Add deactivation and role-update management endpoints'],
+  diff: `@@ -1,38 +1,104 @@
+ package com.example.api;
+
+ import com.example.api.model.*;
+ import com.example.api.repository.UserRepository;
+ import com.example.api.service.UserService;
+ import org.springframework.data.domain.*;
+ import org.springframework.http.*;
+ import org.springframework.web.bind.annotation.*;
+ import org.springframework.web.server.ResponseStatusException;
+ import javax.validation.Valid;
+ import java.util.List;
+
+ @RestController
+ @RequestMapping("/api/v1/users")
+ public class UserController {
+
+   private final UserService    userService;
+   private final UserRepository userRepository;
+
+   public UserController(UserService userService,
+                         UserRepository userRepository) {
+     this.userService    = userService;
+     this.userRepository = userRepository;
+   }
+
+-  @GetMapping
+-  public List<User> listUsers() {
+-    return userRepository.findAll();
+-  }
++  @GetMapping
++  public Page<User> listUsers(
++      @RequestParam(defaultValue = "0")  int page,
++      @RequestParam(defaultValue = "25") int size,
++      @RequestParam(required = false)    String role,
++      @RequestParam(required = false)    String status) {
++
++    Pageable pageable = PageRequest.of(page, size,
++        Sort.by("createdAt").descending());
++
++    if (role   != null) return userRepository.findByRole(role, pageable);
++    if (status != null) return userRepository.findByStatus(status, pageable);
++    return userRepository.findAll(pageable);
++  }
+
+   @GetMapping("/{id}")
+   public UserResponse getUser(@PathVariable Long id) {
+     return userService.findById(id)
+         .map(UserMapper::toResponse)
+         .orElseThrow(() -> new ResponseStatusException(
+             HttpStatus.NOT_FOUND, "User " + id + " not found"));
+   }
+
++  @GetMapping("/search")
++  public List<User> searchUsers(
++      @RequestParam String q,
++      @RequestParam(required = false) String role) {
++
++    if (q == null || q.strip().length() < 2) {
++      throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
++          "Search term must be at least 2 characters");
++    }
++    return userRepository.searchByNameOrEmail(q.strip(), role);
++  }
+
+   @PostMapping
+   @ResponseStatus(HttpStatus.CREATED)
+   public UserResponse createUser(@RequestBody @Valid CreateUserRequest req) {
+     if (userRepository.existsByEmail(req.getEmail())) {
+       throw new ResponseStatusException(HttpStatus.CONFLICT,
+           "Email already registered");
+     }
+     return UserMapper.toResponse(userService.create(req));
+   }
+
++  @PatchMapping("/{id}/deactivate")
++  public UserResponse deactivateUser(@PathVariable Long id) {
++    User user = userService.findById(id)
++        .orElseThrow(() -> new ResponseStatusException(
++            HttpStatus.NOT_FOUND, "User " + id + " not found"));
++    user.setActive(false);
++    user.setDeactivatedAt(Instant.now());
++    return UserMapper.toResponse(userRepository.save(user));
++  }
+
++  @PutMapping("/{id}/role")
++  public UserResponse updateRole(@PathVariable Long id,
++                                  @RequestParam String newRole) {
++    User user = userService.findById(id)
++        .orElseThrow(() -> new ResponseStatusException(
++            HttpStatus.NOT_FOUND, "User " + id + " not found"));
++    userService.validateRole(newRole);
++    user.setRole(newRole);
++    return UserMapper.toResponse(userRepository.save(user));
++  }
+
+   @DeleteMapping("/{id}")
+   @ResponseStatus(HttpStatus.NO_CONTENT)
+   public void deleteUser(@PathVariable Long id) {
+     userService.delete(id);
+   }
+ }`,
+  issues: [
+    { title: 'No Upper Bound on page size — OOM Vector',
+      lines: [30,31,32,33], severity: 'high',
+      keywords: ['size','bound','max','limit','oom','memory','validate','cap','large','param'],
+      fix: 'Add: if (size > 100) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Max page size is 100"). Without a cap, GET /users?size=5000000 forces Spring Data to query 5M rows into a ResultSet, allocating them on the heap — instant OOM in production.',
+      commentTemplate: '"There is no upper bound on the size param. GET /users?size=5000000 forces a 5M-row query into heap memory. Add validation: if (size > 100) throw a 400 BadRequest."'
+    },
+    { title: 'listUsers() Returns Page<User> Entity — Sensitive Fields Exposed',
+      lines: [28,43], severity: 'high',
+      keywords: ['entity','dto','response','expose','sensitive','password','hash','field','leak','map'],
+      fix: 'Change return type to Page<UserResponse> and map: return userRepository.findAll(pageable).map(UserMapper::toResponse). Returning the JPA entity directly exposes passwordHash, securityAnswer, internalNotes, and any other fields added to User in the future.',
+      commentTemplate: '"listUsers() returns Page<User> — the raw JPA entity. This leaks any sensitive fields on User (passwordHash, securityAnswer, etc.) to API callers. Map to Page<UserResponse> before returning."'
+    },
+    { title: 'searchUsers() Returns Unbounded List<User> Entity',
+      lines: [55,62,63], severity: 'medium',
+      keywords: ['entity','dto','paginate','limit','unbounded','list','search','expose','sensitive','size'],
+      fix: 'Add pagination (Pageable) and return List<UserResponse>: return userRepository.searchByNameOrEmail(q, role, pageable).map(UserMapper::toResponse).getContent(). A search for "a" matches most users — without a limit the endpoint scans and serializes the entire table.',
+      commentTemplate: '"searchUsers() returns an unbounded List<User> entity. A broad search like q=a can return hundreds of thousands of rows. Add Pageable with a max size cap, and map to UserResponse DTO."'
+    }
+  ]
+},
+
+{
+  id: 'pr-07', type: 'diff', level: 'Easy',
+  title: 'Add @Cacheable to ProductService to Reduce DB Load',
+  filename: 'ProductService.java',
+  authorName: 'Dev C.',
+  authorNote: 'Product reads are our top DB load — 85% of queries hit the products table and most data is read-only for minutes at a time. I\'ve added Spring\'s @Cacheable to the main read methods to serve hot data from memory. The cache manager is already configured in application.yml.',
+  goalBullets: ['Cache product reads to reduce DB round-trips on hot paths','Cache category-filtered listings separately','Keep cache consistent when products are updated or deleted'],
+  diff: `@@ -1,45 +1,101 @@
+ package com.example.service;
+
+ import com.example.model.Product;
+ import com.example.repository.ProductRepository;
++import org.springframework.cache.annotation.*;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ import java.util.*;
+
+ @Service
++@CacheConfig(cacheNames = "products")
+ public class ProductService {
+
+   private final ProductRepository productRepository;
+
+   public ProductService(ProductRepository productRepository) {
+     this.productRepository = productRepository;
+   }
+
+-  public Optional<Product> findById(Long id) {
+-    return productRepository.findById(id);
+-  }
++  @Cacheable("products")
++  public Optional<Product> findById(Long id) {
++    return productRepository.findById(id);
++  }
+
+-  public List<Product> findByCategory(Long categoryId) {
+-    return productRepository.findByCategoryId(categoryId);
+-  }
++  @Cacheable("products")
++  public List<Product> findByCategory(Long categoryId) {
++    return productRepository.findByCategoryId(categoryId);
++  }
+
++  @Cacheable(value = "products", key = "#query + '-' + #inStock")
++  public List<Product> search(String query, boolean inStock) {
++    return inStock
++        ? productRepository.searchByNameInStock(query)
++        : productRepository.searchByName(query);
++  }
+
+   @Transactional
+   public Product create(Product product) {
+     validateProduct(product);
+     return productRepository.save(product);
+   }
+
+   @Transactional
+   public Product update(Long id, Product updated) {
+     Product existing = productRepository.findById(id)
+         .orElseThrow(() -> new ProductNotFoundException(id));
+     existing.setName(updated.getName());
+     existing.setPrice(updated.getPrice());
+     existing.setStock(updated.getStock());
+-    return productRepository.save(existing);
++    Product saved = productRepository.save(existing);
++    return saved;
+   }
+
+   @Transactional
+   public void delete(Long id) {
+     if (!productRepository.existsById(id)) {
+       throw new ProductNotFoundException(id);
+     }
+     productRepository.deleteById(id);
+   }
+
++  @Transactional
++  public void decrementStock(Long id, int qty) {
++    Product p = productRepository.findById(id)
++        .orElseThrow(() -> new ProductNotFoundException(id));
++    if (p.getStock() < qty) {
++      throw new InsufficientStockException(id, qty);
++    }
++    p.setStock(p.getStock() - qty);
++    productRepository.save(p);
++  }
+
++  @Transactional
++  public void bulkUpdatePrices(Map<Long, BigDecimal> priceMap) {
++    priceMap.forEach((id, price) -> {
++      Product p = productRepository.findById(id)
++          .orElseThrow(() -> new ProductNotFoundException(id));
++      p.setPrice(price);
++      productRepository.save(p);
++    });
++  }
+
+   private void validateProduct(Product product) {
+     if (product.getPrice() == null || product.getPrice().signum() < 0) {
+       throw new IllegalArgumentException("Product price must be non-negative");
+     }
+   }
+ }`,
+  issues: [
+    { title: 'Cache Key Collision Between findById() and findByCategory()',
+      lines: [20,25], severity: 'critical',
+      keywords: ['key','collision','cache','name','type','classcast','findbyid','findby','same','default'],
+      fix: 'Add explicit keys: @Cacheable(value="products", key="\'id:\' + #id") and @Cacheable(value="products", key="\'cat:\' + #categoryId"). Both methods use @Cacheable("products") with the default key (the method argument). findById(42L) and findByCategory(42L) both store under key 42 — whichever runs first "wins", and the second call returns the wrong type → ClassCastException at runtime.',
+      commentTemplate: '"findById and findByCategory both use @Cacheable(\\"products\\") with default keys. findById(42) and findByCategory(42) resolve to the same cache key — the second caller gets back the wrong type (Optional vs List) causing a ClassCastException. Add explicit key prefixes."'
+    },
+    { title: 'No @CacheEvict on update(), delete(), decrementStock(), or bulkUpdatePrices()',
+      lines: [51,60,67,76], severity: 'high',
+      keywords: ['evict','cacheevict','stale','update','delete','invalidate','flush','clear','expire','modify'],
+      fix: 'Add @CacheEvict(value="products", key="#id") (or allEntries=true for bulk) to every write method. Without eviction, a product updated at the DB level is never reflected in the cache — API callers see the old price/stock until the JVM restarts.',
+      commentTemplate: '"update(), delete(), decrementStock(), and bulkUpdatePrices() modify products but never call @CacheEvict. After an update the cache serves the old price indefinitely. Every write method needs @CacheEvict or @CachePut."'
+    },
+    { title: 'No TTL Configured — Cache Entries Live Forever',
+      lines: [11,20,25,30], severity: 'medium',
+      keywords: ['ttl','expire','eviction','time','live','forever','stale','config','duration','timeout'],
+      fix: 'Configure a TTL in CacheManager or application.yml: spring.cache.caffeine.spec=maximumSize=10000,expireAfterWrite=5m. Without TTL, entries inserted at startup are served indefinitely even if the underlying data changes (from other services, migrations, or direct DB writes).',
+      commentTemplate: '"The cache has no TTL. Entries written at app start live forever. If another service or a migration changes a product in the DB, the cache will serve stale data until the JVM restarts. Configure expireAfterWrite in your CacheManager."'
+    }
+  ]
+},
+
+{
+  id: 'pr-08', type: 'diff', level: 'Medium',
+  title: 'Add Bulk Order Import via CSV Upload',
+  filename: 'OrderImportService.java',
+  authorName: 'Sam K.',
+  authorNote: 'Operations team needs to bulk-import orders from partners via CSV. I\'ve added a multipart endpoint that reads the CSV, validates each row, and creates Order records in the database. The method is wrapped in @Transactional so we get an all-or-nothing guarantee.',
+  goalBullets: ['Accept CSV file uploads and parse each row into an Order','Validate required fields (customerId, productId, quantity, unitPrice)','Roll back all inserts if any row fails validation or lookup'],
+  diff: `@@ -1,28 +1,115 @@
+ package com.example.service;
+
+ import com.example.model.*;
+ import com.example.repository.*;
++import com.opencsv.CSVReaderBuilder;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.web.multipart.MultipartFile;
++import java.io.StringReader;
+ import java.util.*;
+
+ @Service
+ public class OrderImportService {
+
+   private final OrderRepository    orderRepository;
+   private final ProductRepository  productRepository;
+   private final CustomerRepository customerRepository;
+
+   public OrderImportService(OrderRepository orderRepository,
+                              ProductRepository productRepository,
+                              CustomerRepository customerRepository) {
+     this.orderRepository    = orderRepository;
+     this.productRepository  = productRepository;
+     this.customerRepository = customerRepository;
+   }
+
+-  @Transactional
+-  public int importOrders(List<Order> orders) {
+-    orderRepository.saveAll(orders);
+-    return orders.size();
+-  }
++  @Transactional
++  public ImportResult importOrders(MultipartFile file) throws Exception {
++    byte[] bytes = file.getBytes();
++    String csv   = new String(bytes);
++    List<String[]> rows = new CSVReaderBuilder(
++        new StringReader(csv)).build().readAll();
++
++    int imported = 0;
++    for (int i = 1; i < rows.size(); i++) {          // row 0 is the header
++      String[] row      = rows.get(i);
++      Long customerId   = Long.parseLong(row[0].trim());
++      Long productId    = Long.parseLong(row[1].trim());
++      int  quantity     = Integer.parseInt(row[2].trim());
++      double unitPrice  = Double.parseDouble(row[3].trim());
++
++      Customer customer = customerRepository.findById(customerId)
++          .orElseThrow(() -> new ImportException(
++              "Row " + i + ": unknown customer " + customerId));
++      Product product = productRepository.findById(productId)
++          .orElseThrow(() -> new ImportException(
++              "Row " + i + ": unknown product " + productId));
++
++      Order order = new Order();
++      order.setCustomer(customer);
++      order.setProduct(product);
++      order.setQuantity(quantity);
++      order.setUnitPrice(unitPrice);
++      order.setStatus(OrderStatus.PENDING);
++      order.setImportedAt(Instant.now());
++      orderRepository.save(order);
++      imported++;
++    }
++    return new ImportResult(imported, rows.size() - 1);
++  }
+
++  public List<ImportError> validateCsv(MultipartFile file) throws Exception {
++    List<ImportError> errors = new ArrayList<>();
++    byte[] bytes = file.getBytes();
++    List<String[]> rows = new CSVReaderBuilder(
++        new StringReader(new String(bytes))).build().readAll();
+
++    for (int i = 1; i < rows.size(); i++) {
++      String[] row = rows.get(i);
++      if (row.length < 4) {
++        errors.add(new ImportError(i, "Expected 4 columns, got " + row.length));
++        continue;
++      }
++      try { Long.parseLong(row[0].trim()); }
++      catch (NumberFormatException e) {
++        errors.add(new ImportError(i, "Invalid customerId: " + row[0]));
++      }
++      try { Integer.parseInt(row[2].trim()); }
++      catch (NumberFormatException e) {
++        errors.add(new ImportError(i, "Invalid quantity: " + row[2]));
++      }
++    }
++    return errors;
++  }
+ }`,
+  issues: [
+    { title: 'Entire CSV Loaded into Memory — OOM on Large Files',
+      lines: [32,33,34,35], severity: 'high',
+      keywords: ['memory','oom','stream','bytes','getbytes','large','file','buffer','chunk','heap'],
+      fix: 'Stream the CSV line-by-line using InputStream: try (BufferedReader reader = new BufferedReader(new InputStreamReader(file.getInputStream()))) { reader.lines().skip(1).forEach(...) }. file.getBytes() allocates the entire file on the heap — a 200 MB CSV uses 200 MB before a single row is processed.',
+      commentTemplate: '"file.getBytes() loads the entire CSV into a byte array on the heap. A 200 MB file allocates 200 MB before processing begins. Stream line-by-line via file.getInputStream() wrapped in a BufferedReader."'
+    },
+    { title: 'One Bad Row Rolls Back the Entire Batch — All-or-Nothing',
+      lines: [37,44,47], severity: 'high',
+      keywords: ['transaction','rollback','atomic','row','error','partial','collect','skip','continue','individual'],
+      fix: 'Separate validation from import, or collect per-row errors and continue: catch exceptions per row, add to an error list, and return ImportResult with both succeeded and failed counts. The @Transactional guarantee means one row with an unknown customerId silently discards 9,999 valid rows with no explanation.',
+      commentTemplate: '"A single bad row throws an exception that rolls back the entire @Transactional batch. Operations loses all 9,999 good rows because of one bad one. Collect per-row errors and continue, or run validation in a separate pre-pass."'
+    },
+    { title: 'orderRepository.save() Called Inside Loop — N+1 Inserts',
+      lines: [57,58], severity: 'medium',
+      keywords: ['loop','save','batch','insert','n+1','performance','saveall','jdbc','round','trip'],
+      fix: 'Collect orders in a List<Order> and call orderRepository.saveAll(orders) after the loop. JDBC batch inserts can be enabled with spring.jpa.properties.hibernate.jdbc.batch_size=50. One INSERT per loop iteration means 10,000 individual round-trips to the DB for a 10k-row CSV.',
+      commentTemplate: '"orderRepository.save() is called inside the loop — one INSERT per row. For 10,000 rows that is 10,000 DB round-trips. Collect into a List<Order> and call saveAll() once after the loop, with Hibernate batch_size configured."'
+    }
+  ]
+},
+
+{
+  id: 'pr-09', type: 'diff', level: 'Medium',
+  title: 'Add Retry Logic to External Payment Gateway Client',
+  filename: 'PaymentGatewayClient.java',
+  authorName: 'Jo W.',
+  authorNote: 'The payment gateway has a 0.8% transient failure rate — timeouts and 503s during peak hours. We are currently surfacing these directly to users. I\'ve wrapped the HTTP call in a retry loop (up to 3 attempts) and added structured logging of the request/response for debugging.',
+  goalBullets: ['Retry transient gateway failures up to 3 times before giving up','Log each attempt with statusCode and latencyMs for observability','Return the last gateway response or throw if all attempts exhausted'],
+  diff: `@@ -1,34 +1,111 @@
+ package com.example.client;
+
+ import com.example.model.*;
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
++import java.io.*;
++import java.net.*;
++import java.net.http.*;
++import java.time.*;
+ import java.util.*;
+
+ @Component
+ public class PaymentGatewayClient {
+
+   private static final Logger log = LoggerFactory.getLogger(PaymentGatewayClient.class);
++  private static final int    MAX_ATTEMPTS = 3;
++  private static final String GATEWAY_URL  = "https://payments.example.com/v2/charge";
+
+-  public GatewayResponse charge(PaymentRequest request) throws Exception {
+-    HttpRequest  httpReq  = buildHttpRequest(request);
+-    HttpResponse<String> resp = HttpClient.newHttpClient().send(httpReq,
+-        HttpResponse.BodyHandlers.ofString());
+-    return parseResponse(resp.body());
+-  }
++  private final HttpClient    httpClient;
++  private final ObjectMapper  objectMapper;
+
++  public PaymentGatewayClient(HttpClient httpClient, ObjectMapper objectMapper) {
++    this.httpClient   = httpClient;
++    this.objectMapper = objectMapper;
++  }
+
++  public GatewayResponse charge(PaymentRequest request) throws Exception {
++    int attempts = 0;
++    Exception lastException = null;
++
++    while (attempts < MAX_ATTEMPTS) {
++      attempts++;
++      long start = System.currentTimeMillis();
++      try {
++        HttpRequest httpReq = buildHttpRequest(request);
++        HttpResponse<String> resp = httpClient.send(httpReq,
++            HttpResponse.BodyHandlers.ofString());
++        long latencyMs = System.currentTimeMillis() - start;
++        log.info("Gateway attempt {}/{} — status={} latencyMs={}",
++            attempts, MAX_ATTEMPTS, resp.statusCode(), latencyMs);
++        return parseResponse(resp.statusCode(), resp.body());
++      } catch (Exception e) {
++        lastException = e;
++        log.warn("Gateway attempt {}/{} failed: {}", attempts, MAX_ATTEMPTS,
++            e.getMessage());
++      }
++    }
++    throw new GatewayException("All " + MAX_ATTEMPTS + " attempts failed",
++        lastException);
++  }
+
+-  private GatewayResponse parseResponse(String body) throws Exception {
+-    return objectMapper.readValue(body, GatewayResponse.class);
+-  }
++  private GatewayResponse parseResponse(int statusCode, String body) throws Exception {
++    if (statusCode == 200 || statusCode == 201) {
++      return objectMapper.readValue(body, GatewayResponse.class);
++    }
++    ErrorResponse err = objectMapper.readValue(body, ErrorResponse.class);
++    throw new GatewayException("Gateway error " + statusCode + ": " + err.getMessage());
++  }
+
+   private HttpRequest buildHttpRequest(PaymentRequest request) throws Exception {
+     String json = objectMapper.writeValueAsString(request);
+     return HttpRequest.newBuilder()
+         .uri(URI.create(GATEWAY_URL))
+         .header("Content-Type", "application/json")
+         .header("X-Api-Key", System.getenv("PAYMENT_API_KEY"))
+-        .POST(HttpRequest.BodyPublishers.ofString(json))
++        .timeout(Duration.ofSeconds(30))
++        .POST(HttpRequest.BodyPublishers.ofString(json))
+         .build();
+   }
+ }`,
+  issues: [
+    { title: 'catch(Exception) Retries Non-Retryable 4xx Errors',
+      lines: [50,51,52,53], severity: 'high',
+      keywords: ['exception','4xx','retry','broad','status','retryable','payment','card','client','specific'],
+      fix: 'Only retry on IOException, HttpTimeoutException, or 5xx status codes. Currently parseResponse() throws a GatewayException for any non-2xx status — including 402 (card declined), 422 (invalid request), 401 (bad API key). Retrying a declined card 3 times irritates the user, wastes time, and can trigger fraud detection.',
+      commentTemplate: '"catch(Exception) retries every failure including 4xx client errors. A declined card (402) or invalid request (422) will be retried 3 times before the user sees the error — retrying these makes no sense and can trigger gateway fraud detection."'
+    },
+    { title: 'No Backoff Between Retry Attempts',
+      lines: [40,41,42,43], severity: 'medium',
+      keywords: ['backoff','sleep','delay','exponential','immediate','throttle','retry','wait','ratelimit','jitter'],
+      fix: 'Add exponential backoff with jitter: Thread.sleep(100L * (1L << (attempts - 1)) + ThreadLocalRandom.current().nextInt(50)). Retrying immediately 3 times in a tight loop hammers a struggling gateway, can exhaust rate limits, and amplifies the load spike that caused the failure.',
+      commentTemplate: '"There is no sleep or backoff between retries. Three consecutive immediate attempts hit the gateway with no breathing room — this amplifies load spikes and can hit rate limits. Add exponential backoff: 100ms, 200ms, 400ms."'
+    },
+    { title: '30-Second Timeout Multiplied by 3 Retries = 90s Thread Block',
+      lines: [97,98,99], severity: 'medium',
+      keywords: ['timeout','thread','block','90','seconds','pool','exhaust','connect','read','duration'],
+      fix: 'Use a shorter per-attempt timeout (e.g. 5s) and set a total deadline across all attempts using a Deadline or a Circuit Breaker (Resilience4j). A 30s timeout × 3 attempts = up to 90 seconds with one thread blocked. Under load, the thread pool saturates quickly.',
+      commentTemplate: '"Duration.ofSeconds(30) × 3 retries means a single failed charge can hold a thread for up to 90 seconds. Under load this saturates the thread pool. Reduce per-attempt timeout and add a total deadline or circuit breaker."'
+    }
+  ]
+},
+
+{
+  id: 'pr-10', type: 'diff', level: 'Medium',
+  title: 'Implement Wallet-to-Wallet Fund Transfer',
+  filename: 'WalletService.java',
+  authorName: 'Chris L.',
+  authorNote: 'Adding the core fund transfer feature between user wallets. The method debits the sender and credits the recipient. I\'ve added balance validation before debiting and kept each wallet operation in its own @Transactional method so they can be reused individually.',
+  goalBullets: ['Debit sender wallet and credit recipient wallet atomically','Validate sender has sufficient balance before debiting','Reuse existing credit/debit methods that are already unit-tested'],
+  diff: `@@ -1,42 +1,118 @@
+ package com.example.service;
+
+ import com.example.model.*;
+ import com.example.repository.WalletRepository;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ import java.math.BigDecimal;
+
+ @Service
+ public class WalletService {
+
+   private static final Logger log = LoggerFactory.getLogger(WalletService.class);
+
+   private final WalletRepository walletRepository;
+   private final TransactionLedger transactionLedger;
+
+   public WalletService(WalletRepository walletRepository,
+                        TransactionLedger transactionLedger) {
+     this.walletRepository  = walletRepository;
+     this.transactionLedger = transactionLedger;
+   }
+
++  public void transfer(Long senderId, Long recipientId, BigDecimal amount) {
++    if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
++      throw new IllegalArgumentException("Transfer amount must be positive");
++    }
++    Wallet sender = walletRepository.findById(senderId)
++        .orElseThrow(() -> new WalletNotFoundException(senderId));
++    if (sender.getBalance().compareTo(amount) < 0) {
++      throw new InsufficientFundsException(senderId, amount);
++    }
++    debit(senderId, amount);
++    credit(recipientId, amount);
++    transactionLedger.record(senderId, recipientId, amount);
++    log.info("Transfer complete: {} -> {} amount={}", senderId, recipientId, amount);
++  }
+
+   @Transactional
+   public void debit(Long walletId, BigDecimal amount) {
+     Wallet wallet = walletRepository.findById(walletId)
+         .orElseThrow(() -> new WalletNotFoundException(walletId));
+     if (wallet.getBalance().compareTo(amount) < 0) {
+       throw new InsufficientFundsException(walletId, amount);
+     }
+     wallet.setBalance(wallet.getBalance().subtract(amount));
+     walletRepository.save(wallet);
+   }
+
+   @Transactional
+   public void credit(Long walletId, BigDecimal amount) {
+     Wallet wallet = walletRepository.findById(walletId)
+         .orElseThrow(() -> new WalletNotFoundException(walletId));
+     wallet.setBalance(wallet.getBalance().add(amount));
+     walletRepository.save(wallet);
+   }
+
++  @Transactional(readOnly = true)
++  public BigDecimal getBalance(Long walletId) {
++    return walletRepository.findById(walletId)
++        .map(Wallet::getBalance)
++        .orElseThrow(() -> new WalletNotFoundException(walletId));
++  }
+
++  @Transactional
++  public void adjustBalance(Long walletId, BigDecimal delta, String reason) {
++    Wallet wallet = walletRepository.findById(walletId)
++        .orElseThrow(() -> new WalletNotFoundException(walletId));
++    BigDecimal newBalance = wallet.getBalance().add(delta);
++    if (newBalance.compareTo(BigDecimal.ZERO) < 0) {
++      throw new IllegalStateException("Adjustment would result in negative balance");
++    }
++    wallet.setBalance(newBalance);
++    walletRepository.save(wallet);
++    transactionLedger.recordAdjustment(walletId, delta, reason);
++  }
+
+-  @Transactional
+-  public void setBalance(Long walletId, BigDecimal balance) {
+-    Wallet wallet = walletRepository.findById(walletId)
+-        .orElseThrow(() -> new WalletNotFoundException(walletId));
+-    wallet.setBalance(balance);
+-    walletRepository.save(wallet);
+-  }
+ }`,
+  issues: [
+    { title: '@Transactional Missing on transfer() — Non-Atomic Transfer',
+      lines: [26], severity: 'critical',
+      keywords: ['transactional','atomic','transaction','rollback','missing','debit','credit','money','partial','annotate'],
+      fix: 'Add @Transactional to transfer(). Without it, debit() and credit() each run in their own separate transactions. If credit() throws after debit() commits, the sender loses funds permanently — money disappears. The outer transfer() method must own a single transaction that wraps both operations.',
+      commentTemplate: '"transfer() has no @Transactional. debit() and credit() each commit their own separate transactions. If credit() fails after debit() commits, the sender loses the funds permanently. Add @Transactional to transfer() so both operations are atomic."'
+    },
+    { title: 'Balance Check and Debit Are Not Atomic — Race Condition',
+      lines: [30,31,32,33,44,45,46,47,48], severity: 'critical',
+      keywords: ['race','atomic','balance','check','debit','concurrent','lock','pessimistic','optimistic','select'],
+      fix: 'Use a pessimistic lock: @Lock(LockModeType.PESSIMISTIC_WRITE) on the repository findById, or execute a single atomic UPDATE wallets SET balance = balance - ? WHERE id = ? AND balance >= ?. The SELECT (getBalance) and UPDATE (setBalance) are separate DB operations — two concurrent transfers from the same wallet both pass the balance check before either debit commits.',
+      commentTemplate: '"The balance check (line 31) and the debit (line 46) are two separate DB operations. Two concurrent transfers from the same wallet can both pass the balance check before either debit commits — resulting in a negative balance. Use a pessimistic lock or an atomic conditional UPDATE."'
+    },
+    { title: 'Deadlock Risk: Lock Ordering Not Enforced on Concurrent Transfers',
+      lines: [36,37], severity: 'high',
+      keywords: ['deadlock','lock','order','concurrent','transfer','ab','ba','cycle','wallet','sequence'],
+      fix: 'Always lock wallets in a consistent order (e.g. by walletId ascending): Long first = Math.min(senderId, recipientId); Long second = Math.max(senderId, recipientId); lock(first); lock(second). If thread 1 runs A→B while thread 2 runs B→A, both lock their sender and wait for the other — classic deadlock.',
+      commentTemplate: '"Two concurrent transfers A→B and B→A can deadlock. Thread 1 locks wallet A and waits for B; thread 2 locks wallet B and waits for A. Enforce a consistent lock-acquisition order (e.g. ascending walletId) to prevent the cycle."'
+    }
+  ]
+},
+
+{
+  id: 'pr-11', type: 'diff', level: 'Medium',
+  title: 'Implement Password Reset via Email Token',
+  filename: 'PasswordResetService.java',
+  authorName: 'Taylor S.',
+  authorNote: 'Adding the forgot-password flow. When a user requests a reset, we generate a random token, store it, and email them a link. When they click the link we validate the token and let them set a new password. Tokens are tied to the user account and single-use.',
+  goalBullets: ['Generate a secure random token and persist it against the user account','Email the user a reset link containing the token','Validate the token on reset and update the password'],
+  diff: `@@ -1,22 +1,110 @@
+ package com.example.service;
+
+ import com.example.model.*;
+ import com.example.repository.*;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import java.time.Instant;
++import java.util.UUID;
+
+ @Service
+ public class PasswordResetService {
+
+   private final UserRepository        userRepository;
+   private final PasswordResetRepository resetRepository;
+   private final PasswordEncoder       passwordEncoder;
+   private final EmailService          emailService;
+
+   public PasswordResetService(UserRepository userRepository,
+                                PasswordResetRepository resetRepository,
+                                PasswordEncoder passwordEncoder,
+                                EmailService emailService) {
+     this.userRepository  = userRepository;
+     this.resetRepository = resetRepository;
+     this.passwordEncoder = passwordEncoder;
+     this.emailService    = emailService;
+   }
+
++  @Transactional
++  public void requestReset(String email) {
++    User user = userRepository.findByEmail(email)
++        .orElseThrow(() -> new UserNotFoundException("No account for " + email));
++
++    String token = UUID.randomUUID().toString();
++
++    PasswordResetToken resetToken = new PasswordResetToken();
++    resetToken.setUser(user);
++    resetToken.setToken(token);
++    resetToken.setCreatedAt(Instant.now());
++    resetToken.setExpiresAt(Instant.now().plusSeconds(3600));
++    resetRepository.save(resetToken);
++
++    String resetLink = "https://app.example.com/reset-password?token=" + token;
++    emailService.send(user.getEmail(), "Password Reset",
++        "Click to reset: " + resetLink);
++  }
+
++  @Transactional
++  public void resetPassword(String token, String newPassword) {
++    PasswordResetToken resetToken = resetRepository.findByToken(token)
++        .orElseThrow(() -> new InvalidTokenException("Token not found"));
++
++    if (resetToken.getExpiresAt().isBefore(Instant.now())) {
++      throw new InvalidTokenException("Token has expired");
++    }
++
++    User user = resetToken.getUser();
++    user.setPasswordHash(passwordEncoder.encode(newPassword));
++    userRepository.save(user);
++  }
+
++  @Transactional(readOnly = true)
++  public boolean isTokenValid(String token) {
++    return resetRepository.findByToken(token)
++        .map(t -> t.getExpiresAt().isAfter(Instant.now()))
++        .orElse(false);
++  }
+
++  @Transactional
++  public void cleanExpiredTokens() {
++    resetRepository.deleteByExpiresAtBefore(Instant.now());
++  }
+ }`,
+  issues: [
+    { title: 'Token Stored as Plaintext — DB Breach Exposes All Active Reset Links',
+      lines: [34,39,40,55,56,57], severity: 'critical',
+      keywords: ['plaintext','token','hash','store','breach','db','expose','sha','digest','secure'],
+      fix: 'Store SHA-256(token) in the DB, not the raw token. On lookup: resetRepository.findByToken(sha256(token)). If the DB is breached, an attacker with the tokens table can immediately reset every account. Storing the hash means the raw token (emailed to the user) cannot be reconstructed from the DB.',
+      commentTemplate: '"The raw UUID token is stored in the DB. A SQL injection or DB breach exposes every active reset token — an attacker can immediately reset any account. Store SHA-256(token) in the DB and hash the incoming token on lookup."'
+    },
+    { title: 'User Enumeration via Exception Message in requestReset()',
+      lines: [30,31], severity: 'high',
+      keywords: ['enumeration','enumerate','message','email','exist','404','user','found','error','different'],
+      fix: 'Return the same 200 OK response whether or not the email exists: if the user is not found, return silently without sending an email. Throwing UserNotFoundException with "No account for {email}" lets an attacker probe which emails are registered by observing the error vs. success response.',
+      commentTemplate: '"Throwing an exception with the email address when the account is not found lets attackers enumerate registered emails by observing the 404 vs 200 difference. Return 200 OK unconditionally and silently skip sending the email."'
+    },
+    { title: 'Token Not Invalidated After Successful Password Reset',
+      lines: [60,61,62,63,64,65], severity: 'high',
+      keywords: ['invalidate','used','delete','single','reuse','token','reset','mark','once','consumed'],
+      fix: 'Add resetRepository.delete(resetToken) after saving the new password. The token remains valid in the DB after use — an attacker who intercepts the email link can reset the password again after the legitimate user has already used it.',
+      commentTemplate: '"After the password is successfully reset the token is not deleted or marked used. The same reset link can be replayed — an attacker who intercepts the email can reset the password again. Delete or mark the token consumed after use."'
+    }
+  ]
+},
+
+{
+  id: 'pr-12', type: 'diff', level: 'Hard',
+  title: 'Add Distributed Lock for Weekly Report Generation Job',
+  filename: 'ReportGenerationJob.java',
+  authorName: 'Morgan P.',
+  authorNote: 'The weekly report job runs via @Scheduled on every pod in the cluster, generating duplicate reports. I\'ve added a Redis-based distributed lock so only one pod executes it at a time. Lock key is report:weekly-lock, TTL 10 minutes (the job normally runs in 2-3 minutes). Lock is acquired with SETNX and released in finally.',
+  goalBullets: ['Ensure only one pod runs the weekly report generation at a time','Use Redis SETNX as a lightweight distributed lock', 'Release the lock in a finally block so it is always freed'],
+  diff: `@@ -1,30 +1,128 @@
+ package com.example.jobs;
+
+ import com.example.service.ReportService;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.data.redis.core.StringRedisTemplate;
+ import org.springframework.scheduling.annotation.Scheduled;
+ import org.springframework.stereotype.Component;
++import java.time.*;
++import java.util.concurrent.TimeUnit;
+
+ @Component
+ public class ReportGenerationJob {
+
++  private static final Logger log = LoggerFactory.getLogger(ReportGenerationJob.class);
+   private static final String LOCK_KEY = "report:weekly-lock";
+   private static final long   LOCK_TTL_MINUTES = 10;
+
+   private final ReportService       reportService;
+   private final StringRedisTemplate redis;
+
+   public ReportGenerationJob(ReportService reportService,
+                               StringRedisTemplate redis) {
+     this.reportService = reportService;
+     this.redis         = redis;
+   }
+
++  @Scheduled(cron = "0 0 2 * * MON")
++  public void runWeeklyReport() {
++    Boolean acquired = redis.opsForValue().setIfAbsent(
++        LOCK_KEY, "locked", LOCK_TTL_MINUTES, TimeUnit.MINUTES);
++
++    try {
++      if (acquired) {
++        log.info("Lock acquired — starting weekly report generation");
++        LocalDate weekStart = LocalDate.now().with(
++            java.time.DayOfWeek.MONDAY).minusWeeks(1);
++        reportService.generateWeekly(weekStart);
++        log.info("Weekly report generation complete");
++      } else {
++        log.info("Lock not acquired — another instance is running the job");
++      }
++    } finally {
++      redis.delete(LOCK_KEY);
++    }
++  }
+
+-  @Scheduled(cron = "0 0 2 * * MON")
+-  public void runWeeklyReport() {
+-    LocalDate weekStart = LocalDate.now().with(
+-        java.time.DayOfWeek.MONDAY).minusWeeks(1);
+-    reportService.generateWeekly(weekStart);
+-  }
+
++  @Scheduled(cron = "0 30 1 * * MON")
++  public void cleanupStaleLocks() {
++    Long ttl = redis.getExpire(LOCK_KEY, TimeUnit.SECONDS);
++    if (ttl != null && ttl < 0) {
++      log.warn("Lock {} has no TTL — removing stale lock", LOCK_KEY);
++      redis.delete(LOCK_KEY);
++    }
++  }
+
++  @Scheduled(cron = "0 0 4 * * MON")
++  public void runPostReportAudit() {
++    log.info("Starting post-report audit");
++    reportService.auditLastWeeklyReport();
++    log.info("Post-report audit complete");
++  }
+ }`,
+  issues: [
+    { title: 'Lock Released in finally Even When Not Acquired — Deletes Another Instance\'s Lock',
+      lines: [53,54], severity: 'critical',
+      keywords: ['finally','delete','acquired','release','other','instance','lock','pod','wrong','owner'],
+      fix: 'Move redis.delete() inside the if (acquired) block: if (acquired) { try { reportService.generateWeekly(...); } finally { redis.delete(LOCK_KEY); } }. The current finally always runs — even when acquired == false. The pod that lost the lock election deletes the winner\'s lock key, allowing a second instance to enter immediately.',
+      commentTemplate: '"redis.delete(LOCK_KEY) is in a finally block that runs even when acquired is false. The pod that failed to acquire the lock deletes the winning pod\'s lock key, allowing a third pod to acquire it — two instances run the job concurrently. Move the delete inside if (acquired)."'
+    },
+    { title: 'No Lock Heartbeat — 10-Minute TTL Expires if Job Takes Longer',
+      lines: [17,28,29,30], severity: 'high',
+      keywords: ['heartbeat','ttl','expire','long','extend','renew','job','duration','timeout','concurrent'],
+      fix: 'Implement a heartbeat thread that extends the TTL every 2 minutes while the job is running: ScheduledExecutorService.scheduleAtFixedRate(() -> redis.expire(LOCK_KEY, 10, MINUTES), 2, 2, MINUTES). If generateWeekly() takes >10 minutes (e.g. on a large dataset), the TTL expires and another instance acquires the lock — two jobs run simultaneously.',
+      commentTemplate: '"The lock TTL is 10 minutes but there is no heartbeat. If generateWeekly() runs longer than 10 minutes the lock expires and a second instance acquires it, running the job concurrently. Add a heartbeat thread that extends the TTL while the job is active."'
+    },
+    { title: 'Lock Not Scoped to Instance — Any Pod Can Release Another\'s Lock',
+      lines: [30,53,54], severity: 'high',
+      keywords: ['owner','instance','pod','value','identifier','hostname','uuid','verify','check','scoped'],
+      fix: 'Store a unique instance ID as the lock value: String instanceId = UUID.randomUUID().toString(); redis.setIfAbsent(LOCK_KEY, instanceId, ...). Only delete if the stored value matches: if (instanceId.equals(redis.opsForValue().get(LOCK_KEY))) redis.delete(LOCK_KEY). Use a Lua script for atomicity. Without this, a slow pod can delete a fast pod\'s lock after the TTL fires.',
+      commentTemplate: '"The lock value is the string \\"locked\\" — any instance can delete it. Store a unique instance ID (UUID) as the value and only delete if your ID matches. Without this, a restarted pod can delete the current owner\'s lock."'
+    }
+  ]
+},
+
+{
+  id: 'pr-13', type: 'diff', level: 'Hard',
+  title: 'Publish Domain Events to Kafka After Order State Changes',
+  filename: 'OrderEventPublisher.java',
+  authorName: 'Riley M.',
+  authorNote: 'We need downstream services (fulfillment, notifications, analytics) to react to order state changes in real time. I\'ve wired Kafka publishing into the order service — when an order is confirmed, shipped, or cancelled we publish a domain event. The Kafka producer is synchronous so we can detect publish failures early.',
+  goalBullets: ['Publish OrderConfirmed, OrderShipped, OrderCancelled events to Kafka topic orders.events','Ensure the event is consistent with the DB state at time of publish','Log failed publishes for monitoring and alerting'],
+  diff: `@@ -1,28 +1,117 @@
+ package com.example.service;
+
+ import com.example.model.*;
+ import com.example.repository.OrderRepository;
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.kafka.core.KafkaTemplate;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+
+ @Service
+ public class OrderEventPublisher {
+
+   private static final Logger log = LoggerFactory.getLogger(OrderEventPublisher.class);
++  private static final String TOPIC = "orders.events";
+
+   private final OrderRepository orderRepository;
++  private final KafkaTemplate<String, String> kafkaTemplate;
++  private final ObjectMapper objectMapper;
+
+   public OrderEventPublisher(OrderRepository orderRepository,
+-                              ReportService reportService) {
++                              KafkaTemplate<String, String> kafkaTemplate,
++                              ObjectMapper objectMapper) {
+     this.orderRepository = orderRepository;
++    this.kafkaTemplate   = kafkaTemplate;
++    this.objectMapper    = objectMapper;
+   }
+
++  @Transactional
++  public void confirmOrder(Long orderId) {
++    Order order = orderRepository.findById(orderId)
++        .orElseThrow(() -> new OrderNotFoundException(orderId));
++    order.setStatus(OrderStatus.CONFIRMED);
++    orderRepository.save(order);
++
++    OrderEvent event = new OrderEvent("ORDER_CONFIRMED", orderId,
++        order.getCustomerId(), order.getTotalAmount());
++    publishEvent(event);
++  }
+
++  @Transactional
++  public void shipOrder(Long orderId, String trackingNumber) {
++    Order order = orderRepository.findById(orderId)
++        .orElseThrow(() -> new OrderNotFoundException(orderId));
++    order.setStatus(OrderStatus.SHIPPED);
++    order.setTrackingNumber(trackingNumber);
++    orderRepository.save(order);
+
++    OrderEvent event = new OrderEvent("ORDER_SHIPPED", orderId,
++        order.getCustomerId(), trackingNumber);
++    publishEvent(event);
++  }
+
++  @Transactional
++  public void cancelOrder(Long orderId, String reason) {
++    Order order = orderRepository.findById(orderId)
++        .orElseThrow(() -> new OrderNotFoundException(orderId));
++    order.setStatus(OrderStatus.CANCELLED);
++    order.setCancelReason(reason);
++    orderRepository.save(order);
+
++    OrderEvent event = new OrderEvent("ORDER_CANCELLED", orderId,
++        order.getCustomerId(), reason);
++    publishEvent(event);
++  }
+
++  private void publishEvent(OrderEvent event) {
++    try {
++      String payload = objectMapper.writeValueAsString(event);
++      kafkaTemplate.send(TOPIC, String.valueOf(event.getOrderId()), payload).get();
++      log.info("Published {} for orderId={}", event.getType(), event.getOrderId());
++    } catch (Exception e) {
++      log.error("Failed to publish {} for orderId={}", event.getType(),
++          event.getOrderId(), e);
++      throw new EventPublishException("Kafka publish failed", e);
++    }
++  }
+ }`,
+  issues: [
+    { title: 'Kafka Publish Inside @Transactional — DB Rolls Back but Event Already Sent',
+      lines: [37,38,39,40,41,42,47,48,49,55,56,57], severity: 'critical',
+      keywords: ['transactional','kafka','publish','rollback','before','commit','outbox','event','ghost','dual'],
+      fix: 'Use the Transactional Outbox pattern: write the event to an outbox table in the same DB transaction as the order update. A separate relay (Debezium CDC or a polling job) reads the outbox and publishes to Kafka. Calling kafkaTemplate.send(...).get() inside @Transactional publishes the event before the DB transaction commits — if the commit fails, the event is already on Kafka with no matching DB record.',
+      commentTemplate: '"publishEvent() is called inside @Transactional before the transaction commits. If the DB commit fails after Kafka publish succeeds, downstream services receive an ORDER_CONFIRMED event for an order that does not exist in the DB. Use the Transactional Outbox pattern."'
+    },
+    { title: 'Kafka Failure Rolls Back the DB Transaction',
+      lines: [98,99,100,101,102,103], severity: 'high',
+      keywords: ['exception','throw','rollback','kafka','fail','db','transaction','decouple','propagate','coupling'],
+      fix: 'Catch the exception without rethrowing inside @Transactional (or publish outside the transaction). Throwing EventPublishException from publishEvent() propagates through the @Transactional boundary and rolls back the DB changes — the order status reverts to PENDING even though the business operation succeeded. DB persistence and messaging should not be in the same transaction.',
+      commentTemplate: '"Throwing EventPublishException inside a @Transactional method rolls back the order status update. A Kafka outage causes every order confirmation to fail at the DB level. Event publishing must be decoupled from the DB transaction."'
+    },
+    { title: 'No Idempotency Key on Events — Duplicate Processing on Retry',
+      lines: [33,34,35,43,44,45,50,51,52], severity: 'high',
+      keywords: ['idempotency','duplicate','retry','consumer','key','id','event','process','twice','deduplication'],
+      fix: 'Add a stable idempotency key to every event: event.setEventId(UUID.nameUUIDFromBytes((event.getType() + orderId + attempt).getBytes()).toString()). Consumers must deduplicate on eventId. Kafka guarantees at-least-once delivery — a network hiccup causes the event to be redelivered. Without idempotency, a consumer that processes ORDER_CONFIRMED twice charges the customer twice.',
+      commentTemplate: '"OrderEvent has no stable idempotency key. Kafka delivers at-least-once — a retry replays the event and the consumer processes it twice (double charge, double fulfillment). Add a stable eventId to each event and have consumers deduplicate on it."'
+    }
+  ]
 }
 
 ];
